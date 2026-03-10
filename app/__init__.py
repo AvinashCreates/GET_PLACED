@@ -1,10 +1,14 @@
 import os
 from flask import Flask
 from pathlib import Path
+from dotenv import load_dotenv
 
 from .db import init_db
 
 def create_app():
+    # Load environment variables from .env file
+    load_dotenv()
+    
     app = Flask(__name__)
     app.config["DATABASE"] = str(Path(app.root_path).parent / "data" / "preppulse.db")
     app.config["SECRET_KEY"] = os.getenv("SECRET_KEY", "dev-secret")

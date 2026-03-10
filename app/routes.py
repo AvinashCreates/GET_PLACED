@@ -8,7 +8,7 @@ from pathlib import Path
 
 import requests as http_requests
 from flask import Blueprint, render_template, jsonify, request, current_app, url_for, redirect, session
-from openai import OpenAI
+from groq import Groq
 from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
 from werkzeug.security import check_password_hash, generate_password_hash
 from werkzeug.utils import secure_filename
@@ -64,14 +64,14 @@ def _get_api_key():
     return current_app.config.get("OPEN_API_KEY") or os.environ.get("OPENAI_API_KEY")
 
 
-def _get_client():
+def _get_groq_client():
     api_key = _get_api_key()
     if not api_key:
-        raise ValueError("OpenAI API key not configured.")
-    return OpenAI(api_key=api_key)
+        raise ValueError("API key not configured.")
+    return Groq(api_key=api_key)
 
 
-def _invoke_chat_response(client, user_message: str, context_text: str = "") -> str:
+def _invoke_chat_response(user_message: str, context_text: str = "") -> str:
     system_prompt = (
         "You are PrepPulse AI assistant. Be concise, actionable, and specific for placement prep: "
         "mock tests, study plans, resume tips. Keep answers under 120 words unless asked for more."
@@ -79,29 +79,32 @@ def _invoke_chat_response(client, user_message: str, context_text: str = "") -> 
     if context_text:
         system_prompt += "\nRelevant context (from resume analysis or user data):\n" + context_text
 
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_message},
-    ]
+    try:
+        client = _get_groq_client()
+        chat_completion = client.chat.completions.create(
+            messages=[
+                {
+                    "role": "system",
+                    "content": system_prompt
+                },
+                {
+                    "role": "user",
+                    "content": user_message,
+                }
+            ],
+            model="llama-3.3-70b-versatile",
+            temperature=0.4,
+        )
+        return chat_completion.choices[0].message.content.strip()
+    except Exception as e:
+        print(f"Error generating chat response: {e}")
+        return ""
 
-    completion = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=messages,
-        temperature=0.4,
-    )
-    return (completion.choices[0].message.content or "").strip()
 
-
-def _synthesize_speech(client, text: str):
-    if not text:
-        return None, None
-    audio = client.audio.speech.create(
-        model="gpt-4o-mini-tts",
-        voice="alloy",
-        input=text,
-    )
-    audio_b64 = base64.b64encode(audio.read()).decode("utf-8")
-    return audio_b64, "audio/mpeg"
+def _synthesize_speech(text: str):
+    # Gemini does not natively synthesize speech via its standard generative API
+    # We gracefully disable TTS here so the frontend handles lack of audio.
+    return None, None
 
 DEFAULT_SKILL_CHECKLIST = {
     "title": "Skill checklist",
@@ -265,39 +268,28 @@ def generate_skill_checklist(onboarding, api_key):
         "overall_score": onboarding.get("overall_score"),
     }
 
-    payload = {
-        "model": "gpt-4o-mini",
-        "temperature": 0.2,
-        "response_format": {"type": "json_object"},
-        "messages": [
-            {"role": "system", "content": "You are a placement mentor."},
-            {"role": "user", "content": prompt},
-            {"role": "user", "content": f"Student context: {json.dumps(user_context)}"},
-        ],
-    }
-
-    request_data = json.dumps(payload).encode("utf-8")
-    request = urllib.request.Request(
-        "https://api.openai.com/v1/chat/completions",
-        data=request_data,
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {api_key}",
-        },
-        method="POST",
-    )
-
     try:
-        with urllib.request.urlopen(request, timeout=15) as response:
-            response_data = json.loads(response.read().decode("utf-8"))
-    except (urllib.error.URLError, json.JSONDecodeError, TimeoutError):
+        client = Groq(api_key=api_key)
+        chat_completion = client.chat.completions.create(
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You are a placement mentor."
+                },
+                {
+                    "role": "user",
+                    "content": f"{prompt}\n\nStudent context: {json.dumps(user_context)}"
+                }
+            ],
+            model="llama-3.3-70b-versatile",
+            temperature=0.2,
+            response_format={"type": "json_object"}
+        )
+        content = chat_completion.choices[0].message.content
+    except Exception as e:
+        print(f"Error generating skill checklist: {e}")
         return build_default_checklist()
-
-    content = (
-        response_data.get("choices", [{}])[0]
-        .get("message", {})
-        .get("content", "")
-    )
+    
     try:
         parsed = json.loads(content)
     except json.JSONDecodeError:
@@ -540,9 +532,8 @@ def chat():
             context_text = str(context_raw)
 
     try:
-        client = _get_client()
-        reply = _invoke_chat_response(client, user_message, context_text)
-        audio_b64, mime = _synthesize_speech(client, reply)
+        reply = _invoke_chat_response(user_message, context_text)
+        audio_b64, mime = _synthesize_speech(reply)
         return jsonify({
             "reply": reply,
             "audio": audio_b64,
@@ -854,7 +845,7 @@ def extract_text_from_file(file_path, filename):
 
 
 def analyze_resume_with_ai(resume_text, api_key):
-    """Analyze resume using OpenAI and return structured suggestions."""
+    """Analyze resume using Gemini and return structured suggestions."""
     prompt = """Analyze this resume for ATS optimization. Give SHORT, CONCISE feedback.
 
 Return JSON with:
@@ -877,38 +868,26 @@ IMPORTANT: Keep all text brief and actionable. No fluff.
 Resume content:
 """ + resume_text
 
-    payload = {
-        "model": "gpt-4o-mini",
-        "temperature": 0.3,
-        "response_format": {"type": "json_object"},
-        "messages": [
-            {"role": "system", "content": "You are a concise ATS resume expert. Give brief, direct feedback. No lengthy explanations."},
-            {"role": "user", "content": prompt},
-        ],
-    }
-
-    request_data = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(
-        "https://api.openai.com/v1/chat/completions",
-        data=request_data,
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {api_key}",
-        },
-        method="POST",
-    )
-
     try:
-        with urllib.request.urlopen(req, timeout=30) as response:
-            response_data = json.loads(response.read().decode("utf-8"))
-    except (urllib.error.URLError, json.JSONDecodeError, TimeoutError) as e:
+        client = Groq(api_key=api_key)
+        chat_completion = client.chat.completions.create(
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You are a concise ATS resume expert. Give brief, direct feedback. No lengthy explanations."
+                },
+                {
+                    "role": "user",
+                    "content": prompt
+                }
+            ],
+            model="llama-3.3-70b-versatile",
+            temperature=0.3,
+            response_format={"type": "json_object"}
+        )
+        content = chat_completion.choices[0].message.content
+    except Exception as e:
         return {"error": str(e), "ats_score": 0, "suggestions": []}
-
-    content = (
-        response_data.get("choices", [{}])[0]
-        .get("message", {})
-        .get("content", "")
-    )
     
     try:
         return json.loads(content)
